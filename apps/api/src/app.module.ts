@@ -33,6 +33,23 @@ import { CommissionConfigModule } from './modules/commission-config/commission-c
 import { FinancialAuditModule } from './modules/financial-audit/financial-audit.module';
 import { SystemConfigModule } from './modules/system-config/system-config.module';
 import { GeneralLedgerModule } from './modules/general-ledger/general-ledger.module';
+import { QueuesModule } from './modules/queues/queues.module';
+import { HttpModule } from '@nestjs/axios';
+import { CustomersModule } from './modules/customers/customers.module';
+import { NotificationsModule } from './modules/notifications/notifications.module';
+import { ReviewsModule } from './modules/reviews/reviews.module';
+import { CouponsModule } from './modules/coupons/coupons.module';
+import { WalletsModule } from './modules/wallets/wallets.module';
+import { PayoutsModule } from './modules/payouts/payouts.module';
+import { RefundsModule } from './modules/refunds/refunds.module';
+import { ReturnsModule } from './modules/returns/returns.module';
+import { DisputesModule } from './modules/disputes/disputes.module';
+import { FlashSalesModule } from './modules/flash-sales/flash-sales.module';
+import { SearchModule } from './modules/search/search.module';
+import { ShippingModule } from './modules/shipping/shipping.module';
+import { VendorModule } from './modules/vendor/vendor.module';
+import { AdminModule } from './modules/admin/admin.module';
+import { OrderItemsModule } from './modules/order-items/order-items.module';
 
 
 @Module({
@@ -69,6 +86,23 @@ import { GeneralLedgerModule } from './modules/general-ledger/general-ledger.mod
     FinancialAuditModule,
     SystemConfigModule,
     GeneralLedgerModule,
+    QueuesModule,
+    HttpModule,
+    CustomersModule,
+    NotificationsModule,
+    ReviewsModule,
+    CouponsModule,
+    WalletsModule,
+    PayoutsModule,
+    RefundsModule,
+    ReturnsModule,
+    DisputesModule,
+    FlashSalesModule,
+    SearchModule,
+    ShippingModule,
+    VendorModule,
+    AdminModule,
+    OrderItemsModule,
   ],
   controllers: [AppController],
   providers: [AppService, SlaEnforcementJob, LowStockAlertJob],

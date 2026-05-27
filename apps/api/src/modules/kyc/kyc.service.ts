@@ -3,10 +3,14 @@ import { PrismaService } from '../prisma/prisma.service';
 import { SubmitKycDto } from './dto/submit-kyc.dto';
 import { ApproveKycDto } from './dto/approve-kyc.dto';
 import { UploadDocumentDto } from './dto/upload-document.dto';
+import { EmailProducer } from '../../modules/queues/email/email.producer';
 
 @Injectable()
 export class KycService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly emailProducer: EmailProducer,
+  ) {}
 
   async submit(dto: SubmitKycDto) {
     const existing = await this.prisma.vendorProfile.findUnique({
@@ -61,18 +65,26 @@ export class KycService {
     return vendor;
   }
 
-  async approve(dto: ApproveKycDto) {
-    const now = new Date();
-
-    return this.prisma.vendorProfile.update({
+async approve(dto: ApproveKycDto) {
+    const vendor = await this.prisma.vendorProfile.update({
       where: { id: dto.vendorId },
       data: {
         kycStatus: dto.status,
-        approvedAt: dto.status === 'VERIFIED' ? now : null,
+        approvedAt: dto.status === 'VERIFIED' ? new Date() : null,
         rejectionReason: dto.rejectionReason,
       },
     });
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: vendor.userId },
+    });
+
+    // Send email asynchronously
+    await this.emailProducer.sendKycStatus(vendor.id, user.email, dto.status);
+
+    return vendor;
   }
+
 
   async reviewDocument(documentId: string, status: string, reviewedBy: string) {
     return this.prisma.kycDocument.update({
@@ -85,3 +97,4 @@ export class KycService {
     });
   }
 }
+
