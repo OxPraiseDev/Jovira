@@ -1,0 +1,440 @@
+Jumia-Style E-Commerce Marketplace
+Complete Functional Specification & Technical Architecture
+
+Version: 1.0  
+Document Type: System-wide Blueprint (Customer, Vendor, Admin, Fulfillment, FinTech)  
+Technology Assumption: TypeScript (NestJS/Fastify backend, Next.js frontend, Prisma ORM, PostgreSQL)
+
+---
+
+Table of Contents
+1. System Overview & Architectural Principles
+2. Shared Backend: Database, API, and Services
+3. Portal 1 – Customer Storefront
+4. Portal 2 – Vendor Center (Seller Center)
+5. Portal 3 – Super Admin Dashboard
+6. Fulfillment Models & Logistics Operations
+7. JumiaPay Financial Ecosystem
+8. Implementation Phases (from MVP to Enterprise)
+
+---
+
+ 1. System Overview & Architectural Principles
+
+The platform is a multi-tenant, multi-country e-commerce marketplace where Customers buy products, Vendors sell them, and Jumia provides the infrastructure, logistics, and financial escrow. It is built as three separate portals (Customer, Vendor, Admin) sharing one PostgreSQL database.
+
+Core Principles:
+- Single Source of Truth: One database cluster with strict foreign keys and audit trails.
+- Type Safety End-to-End: All interfaces, API contracts, and database models are defined in TypeScript, using Zod for validation and Prisma for ORM.
+- Role-Based Access Control (RBAC): JWT tokens with scopes (`customer`, `vendor`, `admin`) enforce portal segregation.
+- Event-Driven Async Operations: Payments, notifications, and logistics updates handled via message queue (Kafka/RabbitMQ) and webhooks.
+- Idempotency Everywhere: All financial operations and webhooks are idempotent to prevent double charges or duplicate releases.
+- Mobile-First & Offline-Ready: Storefront built with Next.js (SSR + PWA), vendor & admin are responsive web.
+
+---
+
+ 2. Shared Backend: Database, API, and Services
+
+ 2.1 Key Database Entities (High-Level)
+Only core tables; full schema detailed in relevant sections.
+
+- users (id, email, phone, password_hash, role, created_at, …) – unified login for all portals.
+- customers (user_id, first_name, last_name, default_address_id, wallet_balance)
+- vendors (user_id, business_name, kyc_status, commission_rule, withdrawal_balance)
+- addresses (id, user_id, label, street, city_id, lat, lon, is_default)
+- cities (id, name, state, country_id)
+- countries (id, code, name, currency, default_language)
+- warehouses (id, name, city_id, type: ‘FC’ | ‘HUB’)
+- products (id, vendor_id, name, description, brand_id, category_id, status)
+- sku_variations (id, product_id, sku, barcode, weight_kg, dimensions_json, price, sale_price, low_stock_threshold)
+- product_inventory (warehouse_id, sku_variation_id, available_qty, reserved_qty)
+- orders (id, customer_id, total_amount, shipping_fee, status, payment_status, delivery_address_id, created_at)
+- order_items (order_id, sku_variation_id, quantity, unit_price, fulfillment_type)
+- vendor_orders (id, order_id, vendor_id, status, accept_deadline, ship_deadline, accept_timestamp, ship_timestamp)
+- payment_transactions (id, order_id, gateway, reference, amount, status)
+- escrow_ledger (id, transaction_id, order_id, buyer_id, amount, entry_type, status)
+- commission_rules (category_id, country_id, type, value, effective_from)
+
+ 2.2 Shared APIs & Services
+All portals communicate through a central REST API (with WebSocket for real-time updates). Key services:
+- User Service: Auth, JWT issuing, OTP.
+- Catalog Service: Products, categories, SKUs, search.
+- Inventory Service: Stock levels, reservations, low-stock alerts.
+- Order Service: Order state machine, order management.
+- Fulfillment Service: Vendor order assignment, SLA tracking, shipment handling.
+- Payment Service: Payment initialization, webhook processing, refunds.
+- Finance Service: Escrow, commissions, payout calculations.
+- Notification Service: Email, SMS, push, in-app.
+
+---
+
+ 3. Portal 1 – Customer Storefront
+
+ 3.1 Registration & Authentication
+
+ 3.1.1 Phone Registration
+- Input: Country (dropdown auto-detected), phone number.
+- OTP Flow: Backend generates 6-digit code, sends via SMS (Twilio/Africa's Talking), stores hashed in Redis with 5-minute expiry.
+- Verification: User enters OTP; if valid, prompts to set password, full name.
+- DB Impact: Inserts `users` with `phone_verified=true`, creates `customers` row.
+
+ 3.1.2 Email Registration
+- Email + password, optional name.
+- Sends magic link (JWT token in URL) to email; on click, activates account.
+- DB: `email_verified=true`.
+
+ 3.1.3 Social Login
+- Google/Facebook OAuth2. Get `provider_id`, email, name, photo.
+- If email exists, link account (add social provider to `user_social_accounts`). Else create new user.
+- Auto-trust verification since from provider.
+
+ 3.1.4 Post-Registration
+- Auto-create virtual wallet (`customer_wallets` row, balance 0).
+- Prompt to set default shipping address (optional).
+
+ 3.2 Product Browsing & Discovery
+
+- Homepage: Personalized recommendations (based on browsing), flash sale banners, category grid.
+- Search: ElasticSearch (or PostgreSQL full-text) with filters (category, price range, brand, rating, location availability).
+- Product Detail Page (PDP):
+  - SKU variation selector (color/size): updates price, image, stock availability.
+  - Ship to location estimator: input city; system checks if deliverable, shows estimated shipping fee, transit days.
+  - “Add to Cart” (for Jumia Express: checks warehouse stock; for dropship: checks vendor inventory flag).
+
+ 3.3 Shopping Cart & Checkout (Multi-Location Dynamic Shipping)
+
+ 3.3.1 Cart Management
+- Persistent cart for logged-in users (`cart_items` table: `user_id`, `sku_variation_id`, `quantity`, `fulfillment_type`).
+- Validations: item still active, stock available, quantity limits per customer.
+
+ 3.3.2 Checkout Flow
+
+Step 1: Address Selection
+- Choose existing address or add new (Google Maps autocomplete resolves `city_id`).
+
+Step 2: Shipping Calculation Engine
+
+The system splits cart items by their origin warehouse/dropship vendor to compute fees.
+
+For Jumia Express items (stock in a central warehouse):
+1. Find warehouse that has all items in sufficient quantity. If multiple, pick the one closest to delivery city (geographical distance or predefined zone).
+2. Get `shipping_zones` row where `from_city_id = warehouse.city_id` and `to_city_id = delivery_city_id`.
+3. Compute total weight of all Express items.
+4. Shipping fee = `zone.base_fee + (total_weight * zone.per_kg_fee)`.
+5. Apply any fragile-item surcharge (from product meta).
+
+For Dropship items:
+- Each vendor has a defined shipping policy (e.g., flat rate by city, or same zone logic). Fee is based on vendor’s origin city (their default warehouse location) to delivery city.
+- If a vendor uses Jumia Logistics, fee pre-calculated; else vendor sets manual flat fee.
+
+For Mixed Cart (Express + Dropship):
+- Fees are summed, but presented as one total to user.
+
+Step 3: Order Summary
+- Subtotal, shipping total, tax (if applicable), total.
+- Apply any coupon code (validations: expiry, min spend, usage limit).
+
+Step 4: Payment
+- Payment method selection: Card, Mobile Money, JumiaPay Wallet, Cash on Delivery (where available).
+- Submit order → `POST /orders` creates order record with status `PENDING_PAYMENT`.
+
+ 3.4 Order Tracking & Timeline
+
+The order has a status state machine:
+
+States (customer-facing):
+- `PENDING_PAYMENT` – waiting for payment
+- `PAID` – confirmed, preparing
+- `PROCESSING` – picked/packed or vendor accepted
+- `SHIPPED` – handed to carrier, tracking number available
+- `IN_TRANSIT` – intermediate scans
+- `OUT_FOR_DELIVERY`
+- `DELIVERED` – final scan, triggers return window
+- `CANCELLED` – by system or buyer
+- `RETURNED` – (sub-process)
+
+Timeline UI: Each state change stored in `order_timeline` (timestamp, status, location, note). Customer sees a stepper with real-time updates via WebSocket.
+
+Actions available:
+- Cancel (only if before `SHIPPED`).
+- Open return/dispute (after `DELIVERED`, within 7 days).
+
+ 3.5 Verified Purchase Reviews
+
+- After order status becomes `DELIVERED`, system sets `is_verified_purchase = true` on the order-item review eligibility.
+- Customer can submit a review for each SKU in that order (only once per SKU). 
+- Review form: star rating (1-5), text, up to 5 photos, specific attributes.
+- Validation: `SELECT COUNT(*) FROM product_reviews WHERE user_id = ? AND sku_variation_id = ? AND is_verified = true`. If >0, deny.
+- Reviews are published immediately; flagged reviews go to admin moderation queue.
+- PDP shows average rating, rating distribution, and filtered “Verified Purchases” only.
+
+---
+
+ 4. Portal 2 – Vendor Center (Seller Center)
+
+Accessible at `seller.yourdomain.com`, isolated by JWT with `role: vendor`.
+
+ 4.1 Multi-Step KYC Onboarding Pipeline
+
+Statuses: `DRAFT` → `SUBMITTED` → `UNDER_REVIEW` → `APPROVED` / `REJECTED`.
+
+Steps:
+1. Business Information
+   - Fields: business name, registered address (country, city), business type (dropdown: sole proprietor, LLC, etc.), industry category.
+   - Upload business registration certificate (image/PDF).
+   - OCR extraction for basic validation, but final approval manual.
+
+2. Tax & Bank Details
+   - TIN (Tax Identification Number) as per country.
+   - VAT certificate if applicable.
+   - Bank account for payouts: bank name, account number, account name.
+   - Instant Bank Verification: System calls a bank API (e.g., Mono, Okra) to verify account name matches business name. On mismatch, flag for manual review.
+
+3. Store Profile
+   - Store name (unique per country), logo, banner.
+   - Default shipping & return policies (choose from templates or custom text).
+   - Customer service email/phone.
+
+Backend: All documents stored in `kyc_documents`, vendor progress stored in `vendors.kyc_step`. On final submission, vendor status `UNDER_REVIEW` and admin is notified.
+
+ 4.2 Inventory & Product Management
+
+ 4.2.1 Product Creation with Variations
+- Vendor creates base product (name, description, brand, category, images).
+- Defines variation types (e.g., Size, Color) and values.
+- System generates all combinations (SKU variations). For each:
+  - SKU code (auto or manual), barcode (optional), price, sale price, weight (kg), dimensions (LxWxH cm), images specific to variation, quantity.
+- Bulk Upload: Download CSV template, fill, upload. Validation same as form.
+
+ 4.2.2 Inventory Tracking
+Two types:
+- Jumia Express (FBJ): Vendor sees stock in Jumia warehouses per SKU. Can request to send more stock (inbound request). Dashboard shows available qty, reserved, inbound.
+- Dropship: Vendor manages their own inventory. They update `vendor_inventory` with available qty. On order, system decrements this.
+
+Low-Stock Alerts:
+- Each SKU has `low_stock_threshold` (default 5).
+- Cron job (every 30 min) checks `product_inventory.available_qty <= threshold` for Express; `vendor_inventory.available_qty <= threshold` for dropship.
+- Generates notification (bell icon + email) to vendor.
+
+ 4.3 Order Fulfillment Dashboard (Dropship Focus)
+
+When an order contains a dropship item, a `vendor_order` is created.
+
+Dashboard View: List of orders to fulfill, filterable by status.
+
+Statuses & Actions:
+- `AWAITING_ACCEPTANCE`: Vendor has SLA deadline (`accept_deadline = order.paid_time + 2 hours`). They must click Accept. If not accepted in time, auto-cancellation triggered (see finance).
+- `ACCEPTED`: Vendor must package and ship. Deadline `ship_deadline`. They can Print Shipping Label & Invoice (system generates PDF with barcode, customer address, hub drop-off address). Once packed, they either hand to carrier or drop at Jumia hub.
+- At drop-off: Hub staff scans barcode → system updates status to `SHIPPED`, records tracking number. If vendor self-ships, they manually enter tracking and mark `SHIPPED`.
+- After that, status flows normally (`IN_TRANSIT`, etc.).
+
+Financial Info: Per order, vendor sees estimated earnings (item price - commission estimate).
+
+ 4.4 Returns & Disputes Management
+- List of return requests from customers, with reason codes.
+- Vendor can accept/refuse within 48h. If refused, escalated to admin.
+- Returned item tracking for Express items.
+
+ 4.5 Performance & Reports
+- Dashboard analytics: sales, returns rate, SLA compliance rate, customer feedback.
+- Financial reports: pending withdrawals, settlement history.
+
+---
+
+ 5. Portal 3 – Super Admin Dashboard
+
+Only accessible by internal staff with `role: admin` from restricted IP/VPN.
+
+ 5.1 KYC Approval Queue
+- List of vendors with `kyc_status = UNDER_REVIEW`.
+- Side-by-side: submitted info, OCR data, bank verification result, documents.
+- Actions: Approve (vendor becomes `ACTIVE`, can list), Reject (with mandatory reason), Request Resubmission (vendor back to `DRAFT` for specific step).
+
+ 5.2 Commission Configuration
+- Table `commission_rules` (category, country, type, value, effective_from, effective_to).
+- UI: Category tree with a modal to set percentage or fixed fee per country. Bulk CSV import.
+- Rule resolution: System picks rule with most recent `effective_from` <= current date for that category-country. Subcategory inherits from parent if no rule set.
+
+ 5.3 Product Moderation Queue
+- All new products and edits are in `status = PENDING_MODERATION`.
+- Grid showing thumbnail, title, price, category, vendor.
+- Actions: Approve (active), Reject (reason), Flag as Prohibited (immediate deactivation, email to vendor).
+- Bulk approve/reject.
+
+ 5.4 Financial Audit & Reconciliation
+- Ledger Viewer: Immutable `transaction_logs` table. Filter by order ID, vendor, date, transaction type (payment, commission, refund, payout).
+- Reconciliation Dashboard: Compare JumiaPay balances vs. gateway settlement reports. Flag discrepancies.
+- Manual Adjustments: ability to add credit/debit with detailed notes (double-entry automatically generated).
+- Daily Settlement Report: PDF auto-generated and emailed to finance.
+
+ 5.5 System Configuration
+- Manage shipping zones, carrier integrations, city lists.
+- Flash sale event management.
+- Global notification templates.
+
+---
+
+ 6. Fulfillment Models & Logistics Operations
+
+ 6.1 Jumia Express (Fulfillment by Jumia – FBJ)
+
+Vendor stocks inventory at Jumia’s central warehouse; Jumia handles everything after order.
+
+ 6.1.1 Inbound Shipment Workflow
+1. Vendor creates Inbound Shipment Request in Seller Center: selects SKUs, quantities.
+2. System checks if product catalog approved and no quantity limits breached.
+3. Creates `inbound_shipment` (status `DRAFT`).
+4. Warehouse Manager approves (status `APPROVED`), system generates barcode labels for cartons.
+5. Vendor ships cartons to warehouse; on arrival, staff scan carton barcode → status `RECEIVING`.
+6. Items individually scanned and inspected. Damaged items marked, deducting from received quantity.
+7. Once complete, status `RECEIVED`, inventory sync: `product_inventory.available_qty += received_qty` for the specific warehouse.
+8. Storage fees: daily cron calculates volume-based fee per SKU per day, posts to `warehouse_storage_charges`; invoiced monthly.
+
+ 6.1.2 Inventory Deduction During Orders/Flash Sales
+- When a customer adds to cart and begins checkout, inventory is reserved atomically: `UPDATE product_inventory SET reserved_qty = reserved_qty + 1, available_qty = available_qty - 1 WHERE sku_variation_id = ? AND available_qty > 0`.
+- A `reservation` record created with TTL (15 min). If order placed, reservation consumed; if expires, released back.
+- Flash sales use the same mechanism but with a dedicated flash sale reservation bucket to avoid interfering with regular stock.
+
+ 6.1.3 Low-Stock Alerts
+- Cron monitors `available_qty <= low_stock_threshold` for each SKU in each Express warehouse.
+- Notifications sent to vendor with a direct link to create a new inbound shipment.
+
+ 6.2 Dropshipping (Vendor Fulfillment)
+
+Vendor holds and ships inventory; uses Jumia Hub drop-off for last-mile or self-ship.
+
+ 6.2.1 Full SLA Lifecycle
+
+Key Deadlines (configurable per country):
+- Accept Order: within 2 hours of payment confirmation.
+- Ship (drop-off/hand-off): within 24 hours of acceptance (or next business day).
+
+Detailed Steps:
+1. When order is paid, `vendor_order` created with `status = AWAITING_ACCEPTANCE`, `accept_deadline = now() + 2h`.
+2. Vendor receives notification; must click Accept in Seller Center.
+   - If time expires, background job cancels the order (see finance) and applies a vendor penalty (negative rating points, possible temporary suspension).
+3. On acceptance: `status = ACCEPTED`, `ship_deadline = now() + 24h`. Vendor prints shipping label/invoice (PDF).
+4. Vendor packs according to packaging standards, affixes label.
+5. Vendor drops at Jumia Hub or hands to integrated carrier. At hub, staff scans the label → system updates `status = SHIPPED`, `ship_timestamp = now()`. Tracking number tied to carrier.
+   - If vendor fails to ship by deadline, background job cancels order automatically.
+6. Tracking updates flow from carrier webhooks to update order status (`IN_TRANSIT`, `OUT_FOR_DELIVERY`, `DELIVERED`).
+
+ 6.2.2 SLA Enforcement Cron
+- Runs every 1 minute, queries:
+  ```sql
+  SELECT * FROM vendor_orders WHERE status = 'AWAITING_ACCEPTANCE' AND accept_deadline < NOW()
+  UNION
+  SELECT * FROM vendor_orders WHERE status = 'ACCEPTED' AND ship_deadline < NOW() AND ship_timestamp IS NULL
+  ```
+- For each, trigger order cancellation, penalty, and refund.
+
+---
+
+ 7. JumiaPay Financial Ecosystem
+
+This is a custom escrow system that holds buyer funds, deducts commissions, and pays vendors.
+
+ 7.1 Payment & Webhook Cycle
+
+Payment Initiation:
+- Frontend calls `POST /payments/initialize` with order ID and method. Backend creates `payment_transaction` (status `INITIATED`), returns gateway auth URL.
+- User pays. Payment gateway (Paystack/Flutterwave) sends webhook `charge.success`.
+
+Webhook Handler (Idempotent):
+- Verify signature.
+- Check `payment_transaction` status: if already `SUCCESS`, acknowledge.
+- Update to `SUCCESS`.
+- Insert into `escrow_ledger`: `amount = order.total_amount`, `entry_type = HOLD`, `status = PENDING`.
+- Update `orders.status = PAID`.
+- Trigger fulfillment (create `vendor_orders` / notify warehouse).
+
+ 7.2 Escrow & Commission Engine (Weekly)
+
+Business Rule: Funds held until 7 days after delivery (return window). Then commissions are taken, remainder becomes vendor’s withdrawable balance.
+
+Weekly Cron (Every Sunday 01:00 UTC):
+1. Find all delivered orders where `delivery_confirmed_at <= NOW() - 7 days` and no active return, and `escrow_ledger.entry_type = HOLD` with status `PENDING`.
+2. For each order, calculate commission from `commission_rules` based on product category and country.
+   - `commission_amount = total_amount * (percent / 100)`
+   - `vendor_amount = total_amount - commission_amount`
+3. Update `escrow_ledger` for HOLD row: `status = RELEASED`.
+4. Insert two new entries:
+   - `entry_type = COMMISSION`, amount = commission_amount, status = `SETTLED`
+   - `entry_type = VENDOR_CREDIT`, amount = vendor_amount, status = `CREDITED`
+5. Insert into `vendor_balances` (amount = vendor_amount, type = 'ORDER_SETTLEMENT'). Update vendor’s `withdrawable_balance`.
+
+Partial Returns: If a return is ongoing, order is skipped; settled next week once resolved.
+
+ 7.3 Cancellation & Refund Engines
+
+ 7.3.1 Automatic Cancellation (SLA Violation)
+Triggered by the SLA cron (vendor didn’t accept/ship). Flow:
+1. Set `orders.status = CANCELLED`, reason `VENDOR_TIMEOUT`.
+2. Set `vendor_order.status = CANCELLED`.
+3. Apply vendor penalty: insert `vendor_penalties` (penalty points). If points > threshold, temporary suspension.
+4. Refund buyer:
+   - If paid by card/mobile money: call gateway refund API with `payment_transaction.reference`.
+     - On success (or webhook confirmation), `payment_transaction.status = REFUNDED`.
+   - If paid by JumiaPay wallet: credit `customer_wallets.balance += total_amount`, insert `wallet_transactions` (type `REFUND`).
+5. Update `escrow_ledger`: original HOLD row status `REFUNDED`, insert a reversal entry.
+6. Notify buyer and vendor.
+
+ 7.3.2 Buyer Voluntary Cancellation (Before Shipped)
+- API `POST /orders/{id}/cancel` checks status is `PAID` or `PROCESSING` (not `SHIPPED`).
+- Execute same refund logic as above immediately.
+- For Jumia Express items: release reservation (reverse inventory deduction).
+- Cancel `vendor_order` if existed (without penalty).
+
+ 7.4 Automated Weekly Payouts to Vendors
+
+Cron (Wednesday 03:00 UTC):
+1. Query `vendor_balances` where status = `AVAILABLE` (not yet paid) and no `payout_id`, grouped by vendor, summing amounts >= minimum threshold (e.g., $10).
+2. For each vendor, get bank account details.
+3. Create a `payout_batch` and individual `payout` records (status `PENDING`).
+4. Use a bulk transfer API (e.g., Flutterwave) to send funds to all vendors in one call.
+5. Handle webhook/callback: on success per transfer, update `payout.status = SUCCESS`, mark associated `vendor_balances` as `PAID_OUT`, subtract from `withdrawable_balance`.
+6. On failure for a specific vendor, mark that payout `FAILED`, revert their balance to `AVAILABLE`, notify to update bank info. Others unaffected.
+7. Send email statements.
+
+ 7.5 Double-Entry Ledger (General Ledger)
+All movements are mirrored in a `general_ledger` table with debit/credit entries for audit. This includes:
+- Customer payments (debit cash, credit buyer escrow liability)
+- Commission (debit escrow, credit commission income)
+- Payouts (debit vendor payable, credit cash)
+This ensures financial integrity and simplifies bank reconciliation.
+
+---
+
+ 8. Implementation Phases (From MVP to Enterprise)
+
+The entire spec above is massive. Build incrementally:
+
+Phase 1 – MVP (3 months):
+- Single country, single warehouse (or dropship only), manual flat-rate shipping.
+- Basic storefront, vendor registration (manual approval), simple order email for fulfillment.
+- Payment integration (card), immediate wallet credit (no escrow), manual vendor payout.
+- Admin: product approval, order view.
+
+Phase 2 – Foundation (6 months):
+- Multi-variation products, dynamic shipping zones, buyer address book.
+- Basic escrow (manual release after return window), automated commission deduction.
+- KYC automation (bank verification), vendor order acceptance flow with SLA.
+- Automated refunds on cancel, low-stock alerts.
+
+Phase 3 – Scale (12 months):
+- Jumia Express warehouse, inbound/outbound, inventory reservation for flash sales.
+- Full escrow cron, 7-day window, automated weekly payouts.
+- Hub drop-off network, carrier tracking integration.
+- Admin: commission config, reconciliation tools.
+
+Phase 4 – Enterprise (Year 2+):
+- Multi-country, multi-currency, cross-border shipping.
+- Advanced WMS, RFQ for carriers, machine learning fraud detection.
+- Advertising platform, seller financing.
+
+---
+
+End of Document
+
+This is your complete print scope. It maps every pixel and every penny of the system. If you need an even deeper dive into a specific module—like the exact Prisma schema, a TypeScript service code structure, or the full state machine transitions—I can produce those as separate, code-heavy addenda. But this document alone will guide your team from zero to a billion-dollar platform.
+
